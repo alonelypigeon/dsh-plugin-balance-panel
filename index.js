@@ -357,6 +357,126 @@ function computeDailyTokens(tokenDays, now, days = TOKEN_CHART_DAYS) {
   return out;
 }
 
+// ================= 每日花费告警（/balance alert） =================
+//
+// 阈值持久化在统计存储（store.alert.threshold，0 = 关闭）。触发时机：
+// 面板路由拉到新鲜余额（写入采样）后检查，/balance 命令也会顺手检查一次
+// （采样是尽力而为的估算，命令路径只读不写）。同一 provider 在同一天
+// 对同一阈值只告警一次（fired 键含日期与阈值，改阈值后当天可重新触发）。
+// 告警出口：console.warn + 面板顶部红色横幅（路由 payload.alert），
+// 不打断会话、不依赖任何外部通知服务。
+
+/** 读取告警配置：{ threshold, fired }（缺省/损坏时回退默认值）。 */
+function alertConfig(store) {
+  const a = store.alert && typeof store.alert === 'object' ? store.alert : {};
+  return {
+    threshold: typeof a.threshold === 'number' && a.threshold > 0 ? a.threshold : 0,
+    fired: a.fired && typeof a.fired === 'object' ? a.fired : {},
+  };
+}
+
+/** 面板 payload 的告警段：{ threshold, triggered: [{ id, label, amount, currency }] }，未设置阈值返回 null。 */
+function alertPayload(store, now) {
+  const cfg = alertConfig(store);
+  if (cfg.threshold <= 0) return null;
+  const triggered = [];
+  for (const a of BALANCE_ADAPTERS) {
+    const samples = store.providers[a.id];
+    if (!samples || samples.length === 0) continue;
+    const todaySpend = computeDailySpend(samples, now, 1)[0]?.amount ?? 0;
+    if (todaySpend < cfg.threshold) continue;
+    const last = samples[samples.length - 1];
+    triggered.push({
+      id: a.id,
+      label: a.label,
+      amount: Math.round(todaySpend * 100) / 100,
+      currency: (last && last.currency ? last.currency : 'CNY').toUpperCase(),
+    });
+  }
+  return { threshold: cfg.threshold, triggered };
+}
+
+/**
+ * 检查所有 balance provider 的今日花费是否越过阈值；越过的标记 fired
+ * （同日同阈值只告警一次）。返回本次新触发的告警列表；没有阈值/没触发
+ * 时返回空数组。触发后 onFire() 会被调用——调用方负责持久化
+ * （统计存储的 persist 带 dirty 标记，这里不直接传它）。
+ */
+function checkSpendAlerts(store, now, onFire, log = console) {
+  const cfg = alertConfig(store);
+  if (cfg.threshold <= 0) return [];
+  const today = dateKey(now);
+  const fired = [];
+  for (const a of BALANCE_ADAPTERS) {
+    const samples = store.providers[a.id];
+    if (!samples || samples.length === 0) continue;
+    const todaySpend = computeDailySpend(samples, now, 1)[0]?.amount ?? 0;
+    if (todaySpend < cfg.threshold) continue;
+    const fireKey = `${today}:${cfg.threshold}`;
+    if (cfg.fired[a.id] === fireKey) continue;
+    cfg.fired[a.id] = fireKey;
+    const last = samples[samples.length - 1];
+    fired.push({
+      id: a.id,
+      label: a.label,
+      amount: Math.round(todaySpend * 100) / 100,
+      currency: (last && last.currency ? last.currency : 'CNY').toUpperCase(),
+    });
+  }
+  if (fired.length > 0) {
+    store.alert = { threshold: cfg.threshold, fired: cfg.fired };
+    onFire?.();
+    for (const f of fired) {
+      log.warn(
+        `[dsh-plugin-balance-panel] ⚠ 每日花费告警：${f.label} 今日已花费 ${f.amount.toFixed(2)} ${f.currency}（阈值 ${cfg.threshold}）`,
+      );
+    }
+  }
+  return fired;
+}
+
+/** /balance alert 子命令：设置/查看/关闭每日花费告警阈值。onChanged 负责持久化。 */
+function balanceAlert(store, onChanged, rawAmount) {
+  const cur = alertConfig(store);
+  const raw = (rawAmount || '').trim();
+  if (raw === '') {
+    const lines = [];
+    if (cur.threshold <= 0) {
+      lines.push('每日花费告警：关闭（未设置阈值）');
+      lines.push('设置：/balance alert <金额>（如 5 或 0.5）；关闭：/balance alert off');
+    } else {
+      lines.push(`每日花费告警：阈值 ${cur.threshold}`);
+      const payload = alertPayload(store, Date.now());
+      if (!payload || payload.triggered.length === 0) {
+        lines.push('今日各 provider 花费均未超过阈值。');
+      } else {
+        for (const t of payload.triggered) {
+          lines.push(`  ⚠ ${t.label}：今日已花费 ${t.amount.toFixed(2)} ${t.currency}，已超过阈值！`);
+        }
+      }
+      lines.push('关闭：/balance alert off');
+    }
+    return ok(lines.join('\n'));
+  }
+  if (raw === 'off' || raw === '0') {
+    if (cur.threshold > 0) {
+      store.alert = { threshold: 0, fired: {} };
+      onChanged();
+    }
+    return ok('每日花费告警已关闭。');
+  }
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    return err('用法：/balance alert <每日花费阈值>（如 5、0.5；0 或 off 关闭）');
+  }
+  const threshold = Number(raw);
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    return err('阈值须为正数（如 5、0.5）。');
+  }
+  store.alert = { threshold, fired: cur.fired };
+  onChanged();
+  return ok(`每日花费告警阈值已设为 ${threshold}（超过该金额将告警；/balance alert 查看，off 关闭）。`);
+}
+
 function ok(text) {
   return { kind: 'success', text };
 }
@@ -642,7 +762,14 @@ function registerStateRoute(ctx, store, stats, persist) {
               stats.dirty = true;
             }
             persist();
+            // 新鲜采样后检查每日花费告警（同一 provider 同日同阈值只告警一次）；
+            // 告警触发会改 store.alert，先置 dirty 再持久化
+            checkSpendAlerts(store, Date.now(), () => {
+              stats.dirty = true;
+              persist();
+            });
             const payload = assemble(results, lastGood);
+            payload.alert = alertPayload(store, Date.now());
             // 只把成功的 provider 记为陈旧回退源，并给 balance provider 附每日花费序列
             for (const p of payload.providers) {
               if (!p.ok) continue;
@@ -831,14 +958,40 @@ function registerStatsCommand(ctx, store) {
 function apply(ctx) {
   ctx.effect(
     function* () {
+      // 统计存储：命令（/balance alert、/stats）、路由（采样/token 写入）
+      // 与告警检查共享同一份内存态 + 文件持久化；先于命令注册创建，
+      // 让 /balance alert 能读写阈值。
+      const storeFile = resolveSpendFile();
+      const store = loadSpendStore(storeFile);
+      const stats = { dirty: false };
+      const persist = () => {
+        if (!stats.dirty) return;
+        stats.dirty = false;
+        saveSpendStore(storeFile, store);
+      };
+
       yield ctx.commands.register({
         name: 'balance',
-        description: 'query account balances of all configured providers (or a specific API key env with DeepSeek format)',
-        input: { hint: '[<API_KEY_ENV>]' },
+        description: 'query account balances of all configured providers (or a specific API key env with DeepSeek format); "alert" manages the daily spend alert threshold',
+        input: { hint: '[<API_KEY_ENV>] | alert [<amount>|off]' },
         handler: (invocation) => {
           const raw = invocation.rawInput.trim();
+          const alertMatch = raw.match(/^alert(?:\s+(.*))?$/);
+          if (alertMatch) {
+            return balanceAlert(store, () => {
+              stats.dirty = true;
+              persist();
+            }, alertMatch[1] ?? '');
+          }
           if (raw.length === 0) {
-            return queryBalance(ctx, null, invocation.signal);
+            // 查询后顺手检查一次告警（采样尽力而为，命令路径只读不写新采样）
+            return queryBalance(ctx, null, invocation.signal).then((r) => {
+              checkSpendAlerts(store, Date.now(), () => {
+                stats.dirty = true;
+                persist();
+              });
+              return r;
+            });
           }
           if (!isShellIdent(raw)) {
             return err(`凭证环境变量名无效：${raw}（须为 POSIX shell 标识符，如 DEEPSEEK_API_KEY）`);
@@ -853,16 +1006,6 @@ function apply(ctx) {
         handler: (invocation) => queryPlan(ctx, invocation.signal),
       });
 
-      // 统计存储：路由（采样/token 写入）与 /stats 命令（读取）共享同一份内存态 + 文件持久化
-      const storeFile = resolveSpendFile();
-      const store = loadSpendStore(storeFile);
-      const stats = { dirty: false };
-      const persist = () => {
-        if (!stats.dirty) return;
-        stats.dirty = false;
-        saveSpendStore(storeFile, store);
-      };
-
       yield registerStatsCommand(ctx, store);
       const state = registerStateRoute(ctx, store, stats, persist);
       yield ctx.webServer.register(state.route);
@@ -875,7 +1018,11 @@ function apply(ctx) {
 // internals：纯函数测试入口（官方惯例，见 dsh-web-app）；不影响插件契约。
 const internals = {
   ADAPTERS,
+  alertConfig,
+  alertPayload,
   assemble,
+  balanceAlert,
+  checkSpendAlerts,
   computeDailySpend,
   computeDailyTokens,
   createTokenAggregator,

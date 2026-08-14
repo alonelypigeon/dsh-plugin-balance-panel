@@ -3,6 +3,7 @@
 DeepSeek Harness cordis 插件：**通用型多 provider 余额/用量面板** —— 查询各主流 API 账户余额与 Coding Plan 用量，并统计每日金额花费与 Token 消耗，右下角挂一枚**液态玻璃气泡**（点击展开明细面板）。
 
 - `/balance [KEY_ENV]` — 汇总所有已配置余额 provider 的余额（指定 KEY_ENV 时按 DeepSeek 格式查询单个凭证）
+- `/balance alert [<金额>|off]` — 查看 / 设置 / 关闭**每日花费告警**阈值（越过阈值时面板顶部红色横幅 + console 告警，同一 provider 同日同阈值只告警一次）
 - `/plan` — 汇总所有已配置的 Coding Plan 用量（5h 滚动 / 每周 / 每月）
 - `/stats [days=7]` — 读取历史统计：每日 Token 消耗 + 各 provider 金额花费（本地数据，无需联网；1-60 天）
 - 右下角气泡 + 点击展开的明细面板（按 provider 分区）
@@ -31,7 +32,8 @@ DeepSeek Harness cordis 插件：**通用型多 provider 余额/用量面板** �
 - **陈旧回退**：某 provider 上游查询失败但上次有成功数据时，面板继续显示上次数据并提示「数据可能已过期」，而不是整块报错；从未成功过才显示错误。
 - **每日花费统计**：每次成功拉到余额时记录采样点（1 小时节流、保留 60 天，含总额/赠送/充值三字段），按相邻采样差分解算：`花费 = max(0, 注入 − Δ总额)`，其中 `注入 = max(0,Δ充值) + max(0,Δ赠送)` —— 消费无论从充值金还是赠送金扣减都能正确计入，充值/发放本身不计为花费；页面未打开的断档日按覆盖天数**均摊**，不会把整段花费堆到恢复日造成虚假尖峰。每个余额 provider 各自统计。（观测极限：充值/发放与消费同日发生时低估；赠送金回收会虚增——平台不提供逐笔账单时的固有近似。）
 - **每日 Token 统计**：监听 DSH 会话事件里 provider 报告的真实 token 用量（`assistant/message` 的 `usage`），按自然日聚合。
-- 统计数据持久化在 `$DSH_HOME/plugins/dsh-plugin-balance-panel/spend-history.json`（v2：按 provider 分桶 + tokens 字段，旧版自动迁移；可用 `DSH_BALANCE_SPEND_FILE` 覆盖），纯本地、不上传、无需平台 token。
+- **每日花费告警**：`/balance alert <金额>` 设置每日花费阈值（0/off 关闭、无参查看）。面板每次拉到新鲜余额后检查：某 provider 今日花费越过阈值即 console 告警 + 面板顶部红色横幅（列出所有越界的 provider 与金额），同一 provider 同日同阈值只告警一次（改阈值当天重新武装）。口径与花费图表一致（余额差分估算、断档按日均摊），阈值按各 provider 币种比较。
+- 统计数据持久化在 `$DSH_HOME/plugins/dsh-plugin-balance-panel/spend-history.json`（v2：按 provider 分桶 + tokens + alert 字段，旧版自动迁移；可用 `DSH_BALANCE_SPEND_FILE` 覆盖），纯本地、不上传、无需平台 token。
 
 数据来自插件注册的 `GET /plugins/balance/state`（exact 路由，优先于 client-modules 的 `/plugins` 前缀）：每个 provider 独立容错（一个查询失败不影响另一个分区），结果带 5s TTL 内存缓存 + 并发 single-flight（多视图轮询不会重复打上游），响应带 `cache-control: no-store`，非 GET 请求返回 405。
 

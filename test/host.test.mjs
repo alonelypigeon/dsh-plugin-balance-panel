@@ -756,6 +756,155 @@ test('/stats：非法天数参数被拒绝，超界天数被钳制', async () =>
   assert.match(over.text, /暂无统计数据/);
 });
 
+// —— 每日花费告警（/balance alert）——
+
+test('告警：/balance alert 用法、设置、查看与关闭', async () => {
+  const { ctx, commands } = makeCtx();
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'balance');
+  // 用法提示
+  const usage = await cmd.handler({ rawInput: 'alert', signal: new AbortController().signal });
+  assert.equal(usage.kind, 'success');
+  assert.match(usage.text, /关闭（未设置阈值）/);
+  // 非法参数
+  const bad = await cmd.handler({ rawInput: 'alert abc', signal: new AbortController().signal });
+  assert.equal(bad.kind, 'error');
+  assert.match(bad.text, /用法：\/balance alert/);
+  const bad2 = await cmd.handler({ rawInput: 'alert -3', signal: new AbortController().signal });
+  assert.equal(bad2.kind, 'error');
+  // 设置
+  const set = await cmd.handler({ rawInput: 'alert 5', signal: new AbortController().signal });
+  assert.equal(set.kind, 'success');
+  assert.match(set.text, /阈值已设为 5/);
+  // 查看：显示阈值
+  const show = await cmd.handler({ rawInput: 'alert', signal: new AbortController().signal });
+  assert.equal(show.kind, 'success');
+  assert.match(show.text, /阈值 5/);
+  // 关闭
+  const off = await cmd.handler({ rawInput: 'alert off', signal: new AbortController().signal });
+  assert.equal(off.kind, 'success');
+  assert.match(off.text, /已关闭/);
+  const show2 = await cmd.handler({ rawInput: 'alert', signal: new AbortController().signal });
+  assert.match(show2.text, /关闭（未设置阈值）/);
+});
+
+test('告警：阈值持久化到统计存储文件', async () => {
+  const { ctx, commands } = makeCtx();
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'balance');
+  await cmd.handler({ rawInput: 'alert 2.5', signal: new AbortController().signal });
+  const saved = JSON.parse(readFileSync(spendFile, 'utf8'));
+  assert.equal(saved.alert.threshold, 2.5);
+});
+
+test('告警：checkSpendAlerts 越过阈值时告警一次，同日同阈值不重复', () => {
+  const { checkSpendAlerts, recordBalanceSample } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime(); // 2026-08-15
+  const store = { version: 2, providers: {}, tokens: [] };
+  store.alert = { threshold: 3, fired: {} };
+  // 两天采样：8/13 总额 110 → 8/15 总额 100（今日花费 10，含跨夜均摊口径 > 3）
+  let samples = [];
+  samples = recordBalanceSample(samples, new Date(2026, 7, 13, 9, 0, 0).getTime(), 110, 50, 40, 'CNY');
+  samples = recordBalanceSample(samples, now, 100, 50, 40, 'CNY');
+  store.providers.deepseek = samples;
+  const warned = [];
+  const log = { warn: (m) => warned.push(m) };
+  // 第一次：触发（8/13→8/15 跨天断档，花费 10 按 3 天均摊 → 今日 3.33 ≥ 阈值 3）
+  const fired1 = checkSpendAlerts(store, now, () => {}, log);
+  assert.equal(fired1.length, 1);
+  assert.equal(fired1[0].id, 'deepseek');
+  assert.equal(fired1[0].amount, 3.33);
+  assert.equal(fired1[0].currency, 'CNY');
+  assert.equal(warned.length, 1);
+  assert.match(warned[0], /每日花费告警/);
+  // 第二次（同日同阈值）：不再触发
+  const fired2 = checkSpendAlerts(store, now + 3600000, () => {}, log);
+  assert.equal(fired2.length, 0);
+  assert.equal(warned.length, 1);
+  // 次日：重新武装，再次触发（8/15→8/16 跨午夜按 2 天均摊：8/2 = 4 ≥ 阈值 3）
+  const nextDay = new Date(2026, 7, 16, 9, 0, 0).getTime();
+  store.providers.deepseek = [
+    ...samples,
+    { t: nextDay, total: 92, topped: 50, granted: 40, currency: 'CNY' },
+  ];
+  const fired3 = checkSpendAlerts(store, nextDay + 3600000, () => {}, log);
+  assert.equal(fired3.length, 1, '次日应重新告警');
+  // 改阈值后当天重新武装（fireKey 含阈值）
+  const store2 = { version: 2, providers: { deepseek: samples }, tokens: [], alert: { threshold: 3, fired: { deepseek: '8-15:3' } } };
+  store2.alert.threshold = 2;
+  const fired4 = checkSpendAlerts(store2, now, () => {}, log);
+  assert.equal(fired4.length, 1, '调低阈值后当天可再次触发');
+  // 阈值关闭时不告警
+  const store3 = { version: 2, providers: { deepseek: samples }, tokens: [], alert: { threshold: 0, fired: {} } };
+  assert.equal(checkSpendAlerts(store3, now, () => {}, log).length, 0);
+});
+
+test('告警：alertPayload 汇总所有越过阈值的 provider（供面板横幅）', () => {
+  const { alertPayload, recordBalanceSample } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const mk = (total, currency, t) => ({ t: t ?? now, total, topped: 50, granted: 40, currency });
+  const store = {
+    version: 2,
+    providers: {
+      deepseek: [mk(110, 'CNY', new Date(2026, 7, 13, 9, 0, 0).getTime()), mk(100, 'CNY')],
+      moonshot: [mk(50, 'USD', new Date(2026, 7, 13, 9, 0, 0).getTime()), mk(45, 'USD')],
+      zhipu: [mk(200, 'CNY', new Date(2026, 7, 13, 9, 0, 0).getTime()), mk(199, 'CNY')],
+    },
+    tokens: [],
+    alert: { threshold: 1.5, fired: {} },
+  };
+  const p = alertPayload(store, now);
+  assert.equal(p.threshold, 1.5);
+  assert.deepEqual(
+    p.triggered.map((t) => t.id).sort(),
+    ['deepseek', 'moonshot'],
+    '只列出今日花费 ≥ 阈值的 provider',
+  );
+  assert.equal(p.triggered[0].amount, 3.33, '跨天断档按日均摊后的今日花费（10/3 四舍五入）');
+  // 未设置阈值 → null（面板不显示横幅）
+  store.alert = { threshold: 0, fired: {} };
+  assert.equal(alertPayload(store, now), null);
+});
+
+test('路由：设置阈值后越过阈值时 payload 带 alert，触发 console 告警', async () => {
+  const { ctx, commands, routes } = makeCtx({ creds: { DEEPSEEK_API_KEY: 'sk-test' } });
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'balance');
+  await cmd.handler({ rawInput: 'alert 1', signal: new AbortController().signal });
+  // 第一轮采样（总额 110）
+  mockFetch([{ match: '/user/balance', body: BALANCE_OK }]);
+  let p1 = await callRoute(ctx, routes, 'GET');
+  assert.ok(p1.alert, '设置阈值后 payload 恒带 alert 段');
+  assert.equal(p1.alert.triggered.length, 0, '只有一条采样时无花费，不触发');
+  // 越过 TTL + 采样节流：第二轮（总额 100，花费 10）
+  const realNow = Date.now;
+  const t0 = realNow();
+  try {
+    Date.now = () => t0 + 2 * 3600000 + 6000;
+    mockFetch([
+      {
+        match: '/user/balance',
+        body: {
+          is_available: true,
+          balance_infos: [
+            { currency: 'CNY', total_balance: '100.00', granted_balance: '10.00', topped_up_balance: '100.00' },
+          ],
+        },
+      },
+    ]);
+    p1 = await callRoute(ctx, routes, 'GET');
+  } finally {
+    Date.now = realNow;
+  }
+  assert.ok(p1.alert, '阈值 1 且花费 10 → payload 带 alert');
+  assert.equal(p1.alert.threshold, 1);
+  assert.equal(p1.alert.triggered.length, 1);
+  assert.equal(p1.alert.triggered[0].id, 'deepseek');
+  // fired 已持久化（同日同阈值不再重复告警）
+  const saved = JSON.parse(readFileSync(spendFile, 'utf8'));
+  assert.ok(saved.alert.fired.deepseek, '告警 fired 标记应持久化');
+});
+
 /** 调用路由 handler，返回解析后的 payload（或原始响应记录）。 */async function callRoute(ctx, routes, method, raw = false) {
   const route = routes.find((r) => r.path === '/plugins/balance/state');
   assert.ok(route, '路由应已注册');

@@ -59,6 +59,8 @@ const zh = {
   'reset.hours.minutes': '{h} 小时 {mm} 分后重置',
   'reset.hours': '{h} 小时后重置',
   'reset.at': '{date} 重置',
+  'alert.banner': '⚠ 今日花费已超过每日告警阈值 {amount}',
+  'alert.off.hint': '用 /balance alert 设置或关闭',
 };
 
 /** en 字典 —— 与 zh 键集一一对应（缺键/多键都会在 UI 上暴露为未翻译键）。 */
@@ -96,6 +98,8 @@ const en = {
   'reset.hours.minutes': '{h} h {mm} min until reset',
   'reset.hours': '{h} h until reset',
   'reset.at': 'Resets {date}',
+  'alert.banner': '⚠ Today\'s spend exceeded the daily alert threshold of {amount}',
+  'alert.off.hint': 'Set or disable it with /balance alert',
 };
 
 const BUBBLE_POS_KEY = 'dsh-plugin-balance-panel:bubble-pos';
@@ -299,6 +303,18 @@ const CSS = `
 .bl-sub { color: var(--dsw-alias-label-caption); font-size: 11.5px; margin-top: 2px; }
 .bl-err { color: var(--dsw-alias-state-error-primary); }
 .bl-stale { color: var(--dsw-alias-state-warning-primary, #d97706); font-size: 11px; line-height: 16px; margin-bottom: 6px; }
+.bl-alert {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-state-error-primary);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 12px;
+  line-height: 18px;
+}
+.bl-alert ul { margin: 4px 0 0; padding-left: 16px; }
+.bl-alert .off-hint { opacity: 0.75; font-size: 11px; }
 .bl-loading { color: var(--dsw-alias-label-caption); }
 .bl-spend { margin-top: 10px; }
 .bl-spend-title { font-size: 11.5px; color: var(--dsw-alias-label-caption); margin-bottom: 4px; }
@@ -807,6 +823,19 @@ function BalancePanel({ t = fallbackT }) {
         {data && (
           <>
             {error && <div className="bl-err">{t('error.refresh', { error })}</div>}
+            {data.alert && data.alert.triggered && data.alert.triggered.length > 0 && (
+              <div className="bl-alert" role="alert">
+                <div>{t('alert.banner', { amount: data.alert.threshold })}</div>
+                <ul>
+                  {data.alert.triggered.map((tr) => (
+                    <li key={tr.id}>
+                      {tr.label}：{tr.amount.toFixed(2)} {tr.currency}
+                    </li>
+                  ))}
+                </ul>
+                <div className="off-hint">{t('alert.off.hint')}</div>
+              </div>
+            )}
             {providers.length === 0 && <div>{t('no.providers')}</div>}
             {providers.map((p) =>
               p.kind === 'balance' ? (

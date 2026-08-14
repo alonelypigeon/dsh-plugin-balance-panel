@@ -2,6 +2,18 @@
 
 独立仓库：DeepSeek Harness cordis 插件（多 provider 余额/用量 + 每日花费与 Token 统计面板）。
 
+## [0.4.0] - 2026-08-15
+
+- **每日花费告警（`/balance alert`）**：参考社区插件（dsh-token-budget /
+  dsh-session-cost）补上的防「token 跑飞」能力——
+  - `/balance alert <金额>` 设置每日花费阈值（0/off 关闭，无参查看当前状态）；
+    阈值持久化在统计存储，改阈值后当天重新武装。
+  - 面板每次拉到新鲜余额后检查：某 provider 今日花费越过阈值即
+    console 告警 + 面板顶部红色横幅（列出所有越界的 provider 与金额），
+    同一 provider 同日同阈值只告警一次。
+  - 触发口径与花费图表一致（余额差分估算，跨天断档按日均摊），
+    阈值在 provider 各自币种下比较。
+
 ## [0.3.1] - 2026-08-14
 
 - **每日 Token 统计覆盖所有 session 的所有调用**：
