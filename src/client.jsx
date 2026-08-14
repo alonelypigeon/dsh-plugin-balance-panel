@@ -51,6 +51,8 @@ const zh = {
   'stale.hint.error': '数据可能已过期（刷新失败：{error}）',
   'spend.title': '每日花费（近 {days} 天）',
   'spend.empty': '（暂无花费数据，页面打开期间自动记录）',
+  'token.title': '每日 Token 消耗（近 {days} 天）',
+  'token.empty': '（暂无 Token 统计，对话后自动记录）',
   'reset.reached': '已到重置时间',
   'reset.imminent': '即将重置',
   'reset.minutes': '{m} 分钟后重置',
@@ -86,6 +88,8 @@ const en = {
   'stale.hint.error': 'Data may be stale (refresh failed: {error})',
   'spend.title': 'Daily spend (last {days} days)',
   'spend.empty': '(No spend data yet — recorded automatically while the page is open)',
+  'token.title': 'Daily token usage (last {days} days)',
+  'token.empty': '(No token stats yet — recorded automatically as you chat)',
   'reset.reached': 'Reset time reached',
   'reset.imminent': 'Resetting soon',
   'reset.minutes': '{m} min until reset',
@@ -512,6 +516,40 @@ function SpendChart({ t, spend }) {
   );
 }
 
+// token 数的人性化显示：1.2k / 3.4M
+function fmtTokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
+
+// 每日 Token 消耗柱状图（DSH session 事件里 provider 报告的 usage 聚合）
+function TokenChart({ t, tokenSpend }) {
+  const days = (tokenSpend && tokenSpend.days) || [];
+  if (days.length === 0) return <div className="bl-sub">{t('token.empty')}</div>;
+  const max = Math.max(...days.map((d) => d.tokens), 0);
+  const scale = max > 0 ? max : 1;
+  return (
+    <div className="bl-spend">
+      <div className="bl-spend-title">{t('token.title', { days: days.length })}</div>
+      <div className="bl-spend-bars">
+        {days.map((d) => (
+          <div key={d.date} className="bl-spend-col" title={`${d.date} · ${d.tokens} tokens`}>
+            <div
+              className={'bl-spend-bar' + (d.tokens <= 0 ? ' zero' : '')}
+              style={{ height: `${Math.max(2, (d.tokens / scale) * 100)}%` }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="bl-spend-axis">
+        <span>0</span>
+        <span>{fmtTokens(max)}</span>
+      </div>
+    </div>
+  );
+}
+
 function BalancePanel({ t = fallbackT }) {
   const [open, setOpen] = useState(false);
   const [data, setData] = useState(null);
@@ -817,6 +855,7 @@ function BalancePanel({ t = fallbackT }) {
             </div>
           ) : null,
         )}
+        {data.tokenSpend && <TokenChart t={t} tokenSpend={data.tokenSpend} />}
           </>
         )}
       </div>

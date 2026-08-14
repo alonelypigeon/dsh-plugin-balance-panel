@@ -157,6 +157,10 @@ test('打包产物与 src 保持同步（关键行为标记抽样）', () => {
     'spend.empty',
     'bl-spend-bars',
     'fallbackT',
+    'token.title',
+    'token.empty',
+    'TokenChart',
+    'fmtTokens',
   ]) {
     assert.ok(bundle.includes(needle), `bundle 应包含 ${needle}`);
     assert.ok(src.includes(needle), `src 应包含 ${needle}`);

@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-balance-panel",
-  "version": "0.2.0",
-  "description": "DeepSeek Harness cordis plugin: query DeepSeek API account balance and Coding Plan usage (/balance /plan) with a right-side liquid-glass bubble panel",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness cordis plugin: multi-provider account balances, Coding Plan usage, daily spend and token charts (/balance /plan) with a right-side liquid-glass bubble panel",
   "type": "module",
   "main": "index.js",
   "exports": {

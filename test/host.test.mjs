@@ -2,25 +2,26 @@
 //
 // 直接 import 本插件的 index.js（@deepseek-ai/dsh-credentials、dsh-home-paths
 // 解析自 devDependencies / node_modules），用 mock cordis ctx + mock global fetch
-// 实测：命令 /balance /plan、数据路由 /plugins/balance/state（含 405 守卫、
-// TTL 缓存、single-flight、provider 独立容错与陈旧回退）、每日花费统计（采样
-// 记录 + 差分估算 + 文件持久化）、以及 ctx.effect 生命周期（停止后注销、重载
-// 不因重复路由而抛错）。全程无真实网络与密钥。
+// 实测：命令 /balance /plan（多 provider 汇总）、数据路由 /plugins/balance/state
+// （凭证探测、多 provider 独立容错、405 守卫、TTL 缓存、single-flight、陈旧回退）、
+// 每日金额花费（采样 + 差分估算 + v2 文件持久化与迁移）、每日 Token 统计
+// （session/event 监听聚合）、以及 ctx.effect 生命周期。全程无真实网络与密钥。
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginIndex = pathToFileURL(join(here, '..', 'index.js'));
 
-/** 模拟 cordis ctx：commands/credentials/webServer + effect 生命周期。 */
+/** 模拟 cordis ctx：commands/credentials/webServer + effect 生命周期 + 事件注册。 */
 function makeCtx({ creds = {} } = {}) {
   const commands = [];
   const routes = [];
   const disposers = [];
+  const handlers = [];
   const ctx = {
     commands: {
       register(def) {
@@ -46,6 +47,7 @@ function makeCtx({ creds = {} } = {}) {
     },
     credentials: {
       resolve: async (ref) => (creds[ref] ? { value: creds[ref], source: 'test' } : undefined),
+      describe: async (ref) => (creds[ref] ? { configured: true } : { configured: false }),
     },
     effect(callback) {
       const gen = callback();
@@ -55,8 +57,15 @@ function makeCtx({ creds = {} } = {}) {
         step = gen.next();
       }
     },
+    on(type, fn) {
+      handlers.push({ type, fn });
+      return () => {
+        const i = handlers.findIndex((h) => h.type === type && h.fn === fn);
+        if (i >= 0) handlers.splice(i, 1);
+      };
+    },
   };
-  return { ctx, commands, routes, stop: () => [...disposers].reverse().forEach((d) => d && d()) };
+  return { ctx, commands, routes, handlers, stop: () => [...disposers].reverse().forEach((d) => d && d()) };
 }
 
 /** 可编程的 fetch mock：按 URL 命中场景表，记录调用次数。 */
@@ -159,7 +168,24 @@ test('/balance 成功：配置 plan 时附带套餐摘要', async () => {
   const cmd = commands.find((c) => c.name === 'balance');
   const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
   assert.equal(result.kind, 'success');
-  assert.match(result.text, /Coding Plan（OpenCode Go）：每月 97%（5h 16% \/ 每周 12%）/);
+  assert.match(result.text, /OpenCode Go：每月 97%（5h 16% \/ 每周 12%）/);
+  assert.equal(calls.length, 2);
+});
+
+test('/balance 成功：汇总多个已配置的余额 provider，未配置的跳过', async () => {
+  const calls = mockFetch([
+    { match: '/user/balance', body: BALANCE_OK },
+    { match: '/v1/users/me/balance', body: { data: { available_balance: 55.5, voucher_balance: 5, cash_balance: 50.5, currency: 'CNY' } } },
+  ]);
+  const { ctx, commands } = makeCtx({ creds: { DEEPSEEK_API_KEY: 'sk-test', MOONSHOT_API_KEY: 'ms-test' } });
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'balance');
+  const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
+  assert.equal(result.kind, 'success');
+  assert.match(result.text, /DeepSeek API：账户可用：是/);
+  assert.match(result.text, /Moonshot \(Kimi\)：账户可用：是/);
+  assert.match(result.text, /CNY：总额 55\.5（赠送 5 \+ 充值 50\.5）/);
+  assert.doesNotMatch(result.text, /智谱/);
   assert.equal(calls.length, 2);
 });
 
@@ -170,7 +196,8 @@ test('/balance 失败：凭证缺失给出可操作提示', async () => {
   const cmd = commands.find((c) => c.name === 'balance');
   const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
   assert.equal(result.kind, 'error');
-  assert.match(result.text, /未找到凭证 DEEPSEEK_API_KEY/);
+  assert.match(result.text, /未配置任何余额 provider 的凭证/);
+  assert.match(result.text, /DEEPSEEK_API_KEY/);
 });
 
 test('/balance 失败：非法环境变量名被拒绝', async () => {
@@ -201,7 +228,7 @@ test('/balance 取消：调用方 signal 中止时返回取消提示', async () 
   aborted.abort();
   const result = await cmd.handler({ rawInput: '', signal: aborted.signal });
   assert.equal(result.kind, 'error');
-  assert.equal(result.text, '操作已取消');
+  assert.match(result.text, /操作已取消/);
 });
 
 test('/plan 未配置时给出指引', async () => {
@@ -210,7 +237,8 @@ test('/plan 未配置时给出指引', async () => {
   const cmd = commands.find((c) => c.name === 'plan');
   const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
   assert.equal(result.kind, 'error');
-  assert.match(result.text, /未配置 OPENCODE_GO_API_KEY/);
+  assert.match(result.text, /未配置任何 Coding Plan 凭证/);
+  assert.match(result.text, /OPENCODE_GO_API_KEY/);
 });
 
 test('/plan 成功：三个用量窗口与重置时间', async () => {
@@ -421,12 +449,122 @@ test('路由：成功采样写入花费历史并附每日花费序列到 deepsee
   } finally {
     Date.now = realNow;
   }
-  // 历史已持久化到临时文件（两条采样）
+  // 历史已持久化到临时文件（v2 格式：按 provider 分桶，两条采样）
   assert.ok(existsSync(spendFile), '花费历史文件应已写入');
   const saved = JSON.parse(readFileSync(spendFile, 'utf8'));
-  assert.equal(saved.length, 2);
-  assert.equal(saved[0].total, 110);
-  assert.equal(saved[1].total, 100);
+  assert.equal(saved.version, 2);
+  assert.deepEqual(Object.keys(saved.providers), ['deepseek']);
+  assert.equal(saved.providers.deepseek.length, 2);
+  assert.equal(saved.providers.deepseek[0].total, 110);
+  assert.equal(saved.providers.deepseek[1].total, 100);
+});
+
+test('花费存储：旧版纯数组格式自动迁移到 v2 providers.deepseek', () => {
+  const { loadSpendStore } = mod.internals;
+  const legacy = [{ t: 1, total: 100, topped: 50 }];
+  writeFileSync(spendFile, JSON.stringify(legacy), 'utf8');
+  const store = loadSpendStore(spendFile);
+  assert.equal(store.version, 2);
+  assert.equal(store.providers.deepseek.length, 1);
+  assert.deepEqual(store.tokens, []);
+});
+
+test('适配器解析：Moonshot / 智谱 / OpenRouter 响应 → 统一余额结构', () => {
+  const { ADAPTERS } = mod.internals;
+  const byId = new Map(ADAPTERS.map((a) => [a.id, a]));
+  const moonshot = byId.get('moonshot').parse({
+    data: { available_balance: 55.5, voucher_balance: 5, cash_balance: 50.5, currency: 'CNY' },
+  });
+  assert.equal(moonshot.ok, true);
+  assert.deepEqual(moonshot.balances[0], {
+    currency: 'CNY',
+    total_balance: 55.5,
+    granted_balance: 5,
+    topped_up_balance: 50.5,
+  });
+  const zhipu = byId.get('zhipu').parse({
+    balance: [{ total: 200, used: 30, available: 170, currency: 'CNY' }],
+  });
+  assert.equal(zhipu.ok, true);
+  assert.equal(zhipu.balances[0].total_balance, 170);
+  const openrouter = byId.get('openrouter').parse({ credits: { total: 10, used: 4, remaining: 6 } });
+  assert.equal(openrouter.ok, true);
+  assert.equal(openrouter.balances[0].total_balance, 6);
+  assert.equal(openrouter.balances[0].currency, 'USD');
+  // 格式异常 → 错误而非崩溃
+  const bad = byId.get('moonshot').parse({ nope: true });
+  assert.equal(bad.ok, false);
+});
+
+test('路由：凭证探测 —— 只查询并返回已配置凭证的 provider', async () => {
+  const calls = mockFetch([
+    { match: '/v1/users/me/balance', body: { data: { available_balance: 55.5, currency: 'CNY' } } },
+  ]);
+  const { ctx, routes } = makeCtx({ creds: { MOONSHOT_API_KEY: 'ms-test' } });
+  mod.apply(ctx);
+  const payload = await callRoute(ctx, routes, 'GET');
+  assert.equal(payload.providers.length, 1, '未配置凭证的 provider 不应出现');
+  assert.equal(payload.providers[0].id, 'moonshot');
+  assert.equal(calls.length, 1, '只查询已配置的 provider');
+});
+
+test('路由：多 provider 独立容错 —— 一个失败不影响其他分区', async () => {
+  mockFetch([
+    { match: '/user/balance', body: BALANCE_OK },
+    { match: '/v1/users/me/balance', error: 'down', status: 502 },
+    { match: '/v1/usage', body: PLAN_OK },
+  ]);
+  const { ctx, routes } = makeCtx({
+    creds: { DEEPSEEK_API_KEY: 'sk-test', MOONSHOT_API_KEY: 'ms-test', OPENCODE_GO_API_KEY: 'og-test' },
+  });
+  mod.apply(ctx);
+  const payload = await callRoute(ctx, routes, 'GET');
+  const ids = payload.providers.map((p) => p.id);
+  assert.deepEqual(ids, ['deepseek', 'moonshot', 'opencode-go']);
+  const ds = payload.providers.find((p) => p.id === 'deepseek');
+  const ms = payload.providers.find((p) => p.id === 'moonshot');
+  const og = payload.providers.find((p) => p.id === 'opencode-go');
+  assert.equal(ds.ok, true);
+  assert.equal(ms.ok, false);
+  assert.match(ms.error, /HTTP 502/);
+  assert.equal(og.ok, true);
+});
+
+test('Token 统计：按自然日聚合 + 近 N 天序列', () => {
+  const { recordTokenDay, computeDailyTokens } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime(); // 2026-08-15（本地时区）
+  let days = [];
+  days = recordTokenDay(days, new Date(2026, 7, 15, 9, 0, 0).getTime(), 1000);
+  days = recordTokenDay(days, new Date(2026, 7, 15, 10, 0, 0).getTime(), 2500); // 同日累加
+  days = recordTokenDay(days, new Date(2026, 7, 14, 20, 0, 0).getTime(), 500);
+  assert.equal(days.length, 2);
+  const today = days.find((d) => d.date === '8-15');
+  assert.equal(today.tokens, 3500);
+  const series = computeDailyTokens(days, now, 14);
+  assert.equal(series.length, 14);
+  const byDate = new Map(series.map((d) => [d.date, d.tokens]));
+  assert.equal(byDate.get('8-15'), 3500);
+  assert.equal(byDate.get('8-14'), 500);
+  assert.equal(series[series.length - 1].date, '8-15');
+});
+
+test('Token 统计：session/event 监听聚合 assistant/message 的 usage 并随路由输出', async () => {
+  const { ctx, routes, handlers } = makeCtx({ creds: { DEEPSEEK_API_KEY: 'sk-test' } });
+  mod.apply(ctx);
+  const evt = handlers.find((h) => h.type === 'session/event');
+  assert.ok(evt, 'apply 必须注册 session/event 监听');
+  evt.fn({}, { type: 'assistant/message', turn: 0, step: 0, message: {}, usage: { inputTokens: 800, outputTokens: 200 } });
+  evt.fn({}, { type: 'assistant/message', usage: { inputTokens: 300, cacheReadTokens: 700 } });
+  evt.fn({}, { type: 'user/message', message: {} }); // 非 assistant/message 忽略
+  evt.fn({}, { type: 'assistant/message', message: {} }); // 无 usage 忽略
+  mockFetch([{ match: '/user/balance', body: BALANCE_OK }]);
+  const payload = await callRoute(ctx, routes, 'GET');
+  const today = payload.tokenSpend.days[payload.tokenSpend.days.length - 1];
+  assert.equal(today.tokens, 2000, '800+200 + 300+700 聚合到当天');
+  // 事件已持久化（v2 文件 tokens 字段）
+  const saved = JSON.parse(readFileSync(spendFile, 'utf8'));
+  assert.equal(saved.version, 2);
+  assert.equal(saved.tokens[0].tokens, 2000);
 });
 
 /** 调用路由 handler，返回解析后的 payload（或原始响应记录）。 */async function callRoute(ctx, routes, method, raw = false) {
