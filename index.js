@@ -233,22 +233,59 @@ function saveSpendStore(file, store) {
   }
 }
 
-/** 追加或节流更新一个余额采样点，并裁剪超出保留窗口的旧采样。 */
-function recordBalanceSample(samples, now, total, topped) {
+/** 追加或节流更新一个余额采样点，并裁剪超出保留窗口的旧采样。
+ *  采样含 granted（赠送金）与 currency（币种）：花费差分公式需要 Δgranted
+ *  才能剔除赠送金发放/回收；/stats 命令需要币种显示。旧采样缺字段时回退。 */
+function recordBalanceSample(samples, now, total, topped, granted = 0, currency = '') {
   const last = samples[samples.length - 1];
   if (last && now - last.t < SPEND_SAMPLE_GAP_MS) {
     last.t = now;
     last.total = total;
     last.topped = topped;
+    last.granted = granted;
+    if (currency) last.currency = currency;
     return samples;
   }
-  samples.push({ t: now, total, topped });
+  samples.push({ t: now, total, topped, granted, currency });
   const cutoff = now - SPEND_KEEP_MS;
   while (samples.length > 1 && samples[0].t < cutoff) samples.shift();
   return samples;
 }
 
-/** 近 N 天每日花费序列（从旧到新）：{ date: 'M-D', amount }。 */
+/** 本地日序号（用于跨日差计算，不受 DST 影响）。 */
+function localDayNumber(t) {
+  const d = new Date(t);
+  return Math.floor((t - d.getTimezoneOffset() * 60000) / 86400000);
+}
+
+/** 某本地日的 'M-D' 键。 */
+function dateKey(t) {
+  const d = new Date(t);
+  return `${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+/** 本地日序号 → 该日的 'M-D' 键（反向还原本地时刻，补偿时区偏移）。 */
+function dateKeyOfDay(day) {
+  const d = new Date(day * 86400000 + new Date().getTimezoneOffset() * 60000);
+  return `${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+/**
+ * 近 N 天每日花费序列（从旧到新）：{ date: 'M-D', amount }。
+ *
+ * 口径（信息论意义上的最优差分法）：消费会从 topped（充值金）或 granted
+ * （赠送金）中扣减，所以 Δtopped / Δgranted 同时混有「外部注入」与「消费扣减」，
+ * 二者不可精确分离。取「注入」= 两者的正向变化（充值/发放只会增加），
+ * 消费通过总额净变化体现：
+ *   花费 = max(0, max(0, Δtopped) + max(0, Δgranted) − Δtotal)，Δ 均为 b − a
+ * 日常纯消费（无论扣 topped 还是 granted）全部正确；充值/发放与消费同日
+ * 发生时低估（净额被记入注入）；赠送金回收（Δgranted < 0 且非消费）会虚增
+ * —— 均为观测极限，README 已注明。旧采样缺少 granted 字段时视为 0。
+ *
+ * 归属：花费发生在 t_a 与 t_b 之间；同日采样对记到当天；跨天断档
+ * （某天页面未打开而没有采样）时按覆盖天数均摊，避免整段花费
+ * 堆到后一个采样日造成虚假尖峰。
+ */
 function computeDailySpend(samples, now, days = SPEND_CHART_DAYS) {
   const out = [];
   for (let i = days - 1; i >= 0; i -= 1) {
@@ -260,11 +297,24 @@ function computeDailySpend(samples, now, days = SPEND_CHART_DAYS) {
   for (let i = 1; i < samples.length; i += 1) {
     const a = samples[i - 1];
     const b = samples[i];
-    const spend = Math.max(0, (b.topped - a.topped) - (b.total - a.total));
+    // 注入 = 充值/发放的正向变化；消费 = 注入 − 总额净变化（钳制 ≥ 0）
+    const inject =
+      Math.max(0, b.topped - a.topped) + Math.max(0, (b.granted ?? a.granted ?? 0) - (a.granted ?? 0));
+    const spend = Math.max(0, inject - (b.total - a.total));
     if (spend <= 0) continue;
-    const d = new Date(b.t);
-    const row = index.get(`${d.getMonth() + 1}-${d.getDate()}`);
-    if (row) row.amount += spend;
+    // 覆盖日数：同日 = 1；跨天 = 本地日差 + 1（断档均摊）
+    const span = localDayNumber(b.t) - localDayNumber(a.t) + 1;
+    if (span <= 1) {
+      const row = index.get(dateKey(b.t));
+      if (row) row.amount += spend;
+      continue;
+    }
+    const share = spend / span;
+    let day = localDayNumber(a.t);
+    for (let k = 0; k < span; k += 1, day += 1) {
+      const row = index.get(dateKeyOfDay(day));
+      if (row) row.amount += share;
+    }
   }
   for (const row of out) row.amount = Math.round(row.amount * 100) / 100;
   return out;
@@ -527,22 +577,13 @@ function assemble(results, lastGood) {
   return { ok: true, providers };
 }
 
-function registerStateRoute(ctx, onToken) {
+function registerStateRoute(ctx, store, stats, persist) {
   // 缓存与 in-flight 状态属于本次 apply 的闭包：插件重载后旧状态随旧 context 一起废弃，
   // 不会跨实例泄漏。
   let stateCache = null; // { t: number, payload: object }
   let inflight = null; // Promise<object> | null（single-flight）
   const lastGood = {}; // { [adapterId]: 上次成功的 provider }（陈旧回退源）
-  // 花费/Token 统计（per-apply 内存态 + 文件持久化）
-  const storeFile = resolveSpendFile();
-  const store = loadSpendStore(storeFile);
-  let dirty = false;
-
-  const persist = () => {
-    if (!dirty) return;
-    dirty = false;
-    saveSpendStore(storeFile, store);
-  };
+  // 统计存储由 apply 创建并共享（路由写入，/stats 命令读取）
 
   const route = {
     kind: 'exact',
@@ -579,9 +620,17 @@ function registerStateRoute(ctx, onToken) {
               const total = Number(b0.total_balance);
               if (!Number.isFinite(total)) continue;
               const topped = Number(b0.topped_up_balance);
+              const granted = Number(b0.granted_balance);
               const samples = store.providers[r.adapter.id] || (store.providers[r.adapter.id] = []);
-              recordBalanceSample(samples, Date.now(), total, Number.isFinite(topped) ? topped : 0);
-              dirty = true;
+              recordBalanceSample(
+                samples,
+                Date.now(),
+                total,
+                Number.isFinite(topped) ? topped : 0,
+                Number.isFinite(granted) ? granted : 0,
+                typeof b0.currency === 'string' ? b0.currency : '',
+              );
+              stats.dirty = true;
             }
             persist();
             const payload = assemble(results, lastGood);
@@ -607,7 +656,7 @@ function registerStateRoute(ctx, onToken) {
       send(await inflight);
     },
   };
-  return { route, persist, tokenStore: store };
+  return { route };
 }
 
 // —— 每日 Token 统计：监听 session/event，聚合 assistant/message 的 provider usage ——
@@ -628,6 +677,62 @@ function registerTokenListener(ctx, store, onPersist) {
     if (total <= 0) return;
     recordTokenDay(store.tokens, Date.now(), total);
     onPersist();
+  });
+}
+
+// —— /stats：读取历史统计（每日 Token 消耗 + 各 provider 金额花费）——
+// 数据来自本地持久化的统计存储（与面板同一份），无需联网。
+const STATS_DEFAULT_DAYS = 7;
+const STATS_MAX_DAYS = 60; // 与采样/Token 保留窗口一致
+
+function queryStats(store, rawDays, signal) {
+  const raw = (rawDays || '').trim();
+  let days = STATS_DEFAULT_DAYS;
+  if (raw.length > 0) {
+    if (!/^\d+$/.test(raw)) return err(`天数无效：${raw}（须为 1-${STATS_MAX_DAYS} 的整数）`);
+    days = Math.min(Math.max(parseInt(raw, 10), 1), STATS_MAX_DAYS);
+  }
+  const now = Date.now();
+  const lines = [];
+
+  // Token 消耗（真实 usage 聚合）
+  const tokenDays = computeDailyTokens(store.tokens, now, days);
+  const tokenTotal = tokenDays.reduce((sum, d) => sum + d.tokens, 0);
+  if (tokenTotal > 0) {
+    lines.push(`== Token 消耗（近 ${days} 天）==`);
+    for (const d of tokenDays) {
+      if (d.tokens > 0) lines.push(`  ${d.date}  ${d.tokens.toLocaleString()}`);
+    }
+    lines.push(`  合计  ${tokenTotal.toLocaleString()} tokens`);
+  }
+
+  // 金额花费（余额差分估算，按 provider 分区）
+  for (const a of BALANCE_ADAPTERS) {
+    const samples = store.providers[a.id];
+    if (!samples || samples.length === 0) continue;
+    const spendDays = computeDailySpend(samples, now, days);
+    const total = spendDays.reduce((sum, d) => sum + d.amount, 0);
+    if (total <= 0) continue;
+    const currency = (samples[samples.length - 1]?.currency || 'CNY').toUpperCase();
+    lines.push(`== ${a.label} 金额花费（近 ${days} 天）==`);
+    for (const d of spendDays) {
+      if (d.amount > 0) lines.push(`  ${d.date}  ${d.amount.toFixed(2)} ${currency}`);
+    }
+    lines.push(`  合计  ${total.toFixed(2)} ${currency}`);
+  }
+
+  if (lines.length === 0) {
+    return err('（暂无统计数据：需要面板轮询过余额、或 DSH 中有过对话后自动记录）');
+  }
+  return ok(lines.join('\n'));
+}
+
+function registerStatsCommand(ctx, store) {
+  return ctx.commands.register({
+    name: 'stats',
+    description: 'show historical daily token usage and per-provider spend from local stats',
+    input: { hint: '[days=7]' },
+    handler: (invocation) => queryStats(store, invocation.rawInput, invocation.signal),
   });
 }
 
@@ -656,9 +761,20 @@ function apply(ctx) {
         handler: (invocation) => queryPlan(ctx, invocation.signal),
       });
 
-      const state = registerStateRoute(ctx);
+      // 统计存储：路由（采样/token 写入）与 /stats 命令（读取）共享同一份内存态 + 文件持久化
+      const storeFile = resolveSpendFile();
+      const store = loadSpendStore(storeFile);
+      const stats = { dirty: false };
+      const persist = () => {
+        if (!stats.dirty) return;
+        stats.dirty = false;
+        saveSpendStore(storeFile, store);
+      };
+
+      yield registerStatsCommand(ctx, store);
+      const state = registerStateRoute(ctx, store, stats, persist);
       yield ctx.webServer.register(state.route);
-      yield registerTokenListener(ctx, state.tokenStore, state.persist);
+      yield registerTokenListener(ctx, store, persist);
     },
     'dsh-plugin-balance-panel registrations',
   );

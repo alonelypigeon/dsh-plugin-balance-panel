@@ -126,10 +126,11 @@ test('模块导出契约：name/inject/apply + internals', async () => {
   assert.equal(typeof mod.internals.recordBalanceSample, 'function');
 });
 
-test('apply 经 ctx.effect 注册两命令 + 一路由，stop 后全部注销', async () => {
+test('apply 经 ctx.effect 注册三命令 + 一路由，stop 后全部注销', async () => {
   const { ctx, commands, routes, stop } = makeCtx();
   mod.apply(ctx);
-  assert.equal(commands.length, 2);
+  assert.equal(commands.length, 3);
+  assert.deepEqual(commands.map((c) => c.name), ['balance', 'plan', 'stats']);
   assert.equal(routes.length, 1);
   assert.equal(routes[0].kind, 'exact');
   assert.equal(routes[0].path, '/plugins/balance/state');
@@ -397,23 +398,85 @@ test('花费统计：采样节流（1 小时内更新，之后追加）与窗口
   assert.ok(samples.every((s) => s.t >= cutoff || samples.indexOf(s) === 0), '60 天窗口外的旧采样被裁剪');
 });
 
-test('花费统计：每日花费差分估算（剔除充值、钳制 ≥ 0、按采样归属日）', () => {
+test('花费统计：每日花费差分估算（剔除充值、跨午夜对均摊、按采样归属日）', () => {
   const { computeDailySpend } = mod.internals;
   const now = new Date(2026, 7, 15, 12, 0, 0).getTime(); // 2026-08-15（本地时区）
   const samples = [
-    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 100, topped: 50 }, // 8/13 花 10
-    { t: new Date(2026, 7, 13, 23, 0, 0).getTime(), total: 90, topped: 50 },
-    { t: new Date(2026, 7, 14, 9, 0, 0).getTime(), total: 85, topped: 50 }, // 8/14 花 5，然后充值 65
-    { t: new Date(2026, 7, 14, 23, 0, 0).getTime(), total: 150, topped: 115 }, // Δtopped−Δtotal = 65−65 = 0
-    { t: new Date(2026, 7, 15, 10, 0, 0).getTime(), total: 148, topped: 115 }, // 8/15 花 2
+    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 100, topped: 50, granted: 40 }, // 8/13 花 10（同日对）
+    { t: new Date(2026, 7, 13, 23, 0, 0).getTime(), total: 90, topped: 50, granted: 40 },
+    { t: new Date(2026, 7, 14, 9, 0, 0).getTime(), total: 85, topped: 50, granted: 40 }, // 8/13 夜→8/14 早 花 5（跨夜对，均摊两天）
+    { t: new Date(2026, 7, 14, 23, 0, 0).getTime(), total: 150, topped: 115, granted: 40 }, // 充值 65 无花费
+    { t: new Date(2026, 7, 15, 10, 0, 0).getTime(), total: 148, topped: 115, granted: 40 }, // 8/14 夜→8/15 早 花 2（跨夜对）
   ];
   const days = computeDailySpend(samples, now, 14);
   assert.equal(days.length, 14);
   const byDate = new Map(days.map((d) => [d.date, d.amount]));
-  assert.equal(byDate.get('8-13'), 10, '8/13 花费 10');
-  assert.equal(byDate.get('8-14'), 5, '8/14 的花费 5（8/13 夜到 8/14 早的差分归属 8/14）；充值对贡献 0');
-  assert.equal(byDate.get('8-15'), 2, '8/15 花费 2');
+  assert.equal(byDate.get('8-13'), 12.5, '8/13：同日对 10 + 跨夜对一半 2.5');
+  assert.equal(byDate.get('8-14'), 3.5, '8/14：跨夜对一半 2.5 + 跨夜对一半 1（充值对贡献 0）');
+  assert.equal(byDate.get('8-15'), 1, '8/15：跨夜对一半 1');
   assert.equal(days[days.length - 1].date, '8-15', '序列从旧到新，今天在末尾');
+});
+
+test('花费统计：消费从充值金扣减时正确计入（Δtopped 为负）', () => {
+  const { computeDailySpend } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const samples = [
+    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 90, topped: 50, granted: 40 },
+    { t: new Date(2026, 7, 13, 20, 0, 0).getTime(), total: 85, topped: 45, granted: 40 }, // 消费 5 扣 topped
+  ];
+  const days = computeDailySpend(samples, now, 14);
+  assert.equal(new Map(days.map((d) => [d.date, d.amount])).get('8-13'), 5, '消费扣 topped 必须计为花费');
+});
+
+test('花费统计：消费从赠送金扣减时正确计入（Δgranted 为负）', () => {
+  const { computeDailySpend } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const samples = [
+    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 90, topped: 50, granted: 40 },
+    { t: new Date(2026, 7, 13, 20, 0, 0).getTime(), total: 85, topped: 50, granted: 35 }, // 消费 5 扣 granted
+  ];
+  const days = computeDailySpend(samples, now, 14);
+  assert.equal(new Map(days.map((d) => [d.date, d.amount])).get('8-13'), 5, '消费扣 granted 必须计为花费');
+});
+
+test('花费统计：纯充值/纯发放不产生花费（正向注入被总额变化抵消）', () => {
+  const { computeDailySpend } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const mk = (total, topped, granted) => ({ t: now - 2 * 3600000, total, topped, granted });
+  const a1 = mk(90, 50, 40);
+  const b1 = { ...mk(155, 115, 40), t: now }; // 充值 65
+  const days1 = computeDailySpend([a1, b1], now, 14);
+  assert.equal(new Map(days1.map((d) => [d.date, d.amount])).get('8-15'), 0, '充值不应算作花费');
+  const a2 = mk(90, 50, 40);
+  const b2 = { ...mk(100, 50, 50), t: now }; // 发放 10
+  const days2 = computeDailySpend([a2, b2], now, 14);
+  assert.equal(new Map(days2.map((d) => [d.date, d.amount])).get('8-15'), 0, '发放不应算作花费');
+});
+
+test('花费统计：跨天断档按覆盖天数均摊（不堆到恢复日）', () => {
+  const { computeDailySpend } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const samples = [
+    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 100, topped: 50, granted: 40 }, // 8/13 采样
+    { t: new Date(2026, 7, 15, 9, 0, 0).getTime(), total: 90, topped: 50, granted: 40 }, // 8/15 恢复（8/14 无采样）
+  ];
+  const days = computeDailySpend(samples, now, 14);
+  const byDate = new Map(days.map((d) => [d.date, d.amount]));
+  const share = Math.round((10 / 3) * 100) / 100;
+  assert.equal(byDate.get('8-13'), share, '断档区间首日均摊 10/3');
+  assert.equal(byDate.get('8-14'), share, '断档日均摊 10/3');
+  assert.equal(byDate.get('8-15'), share, '恢复日均摊 10/3');
+});
+
+test('花费统计：旧采样无 granted 字段时回退旧口径（Δgranted=0）', () => {
+  const { computeDailySpend } = mod.internals;
+  const now = new Date(2026, 7, 15, 12, 0, 0).getTime();
+  const samples = [
+    { t: new Date(2026, 7, 13, 9, 0, 0).getTime(), total: 100, topped: 50 }, // 无 granted（v2 前的旧数据）
+    { t: new Date(2026, 7, 13, 20, 0, 0).getTime(), total: 90, topped: 50 },
+  ];
+  const days = computeDailySpend(samples, now, 14);
+  assert.equal(new Map(days.map((d) => [d.date, d.amount])).get('8-13'), 10, '旧数据按 Δtopped−Δtotal 计算');
 });
 
 test('路由：成功采样写入花费历史并附每日花费序列到 deepseek provider', async () => {
@@ -573,6 +636,74 @@ test('Token 统计：session/event 监听聚合 assistant/message 的 usage 并�
   const saved = JSON.parse(readFileSync(spendFile, 'utf8'));
   assert.equal(saved.version, 2);
   assert.equal(saved.tokens[0].tokens, 2000);
+});
+
+test('/stats：无统计数据时给出提示', async () => {
+  const { ctx, commands } = makeCtx();
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'stats');
+  const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
+  assert.equal(result.kind, 'error');
+  assert.match(result.text, /暂无统计数据/);
+});
+
+test('/stats：读取历史 Token 消耗与金额花费（与路由/事件写入共用存储）', async () => {
+  const { ctx, commands, routes, handlers } = makeCtx({ creds: { DEEPSEEK_API_KEY: 'sk-test' } });
+  mod.apply(ctx);
+  // 1) 路由轮询写入余额采样（两次，跨 >1h，模拟消费）
+  const realNow = Date.now;
+  const t0 = realNow();
+  try {
+    mockFetch([
+      { match: '/user/balance', body: BALANCE_OK }, // total 110
+    ]);
+    await callRoute(ctx, routes, 'GET');
+    Date.now = () => t0 + 2 * 3600000 + 6000;
+    mockFetch([
+      {
+        match: '/user/balance',
+        body: {
+          is_available: true,
+          balance_infos: [
+            { currency: 'CNY', total_balance: '100.00', granted_balance: '10.00', topped_up_balance: '100.00' },
+          ],
+        },
+      },
+    ]);
+    await callRoute(ctx, routes, 'GET');
+    // 2) 会话事件写入 token 统计
+    const evt = handlers.find((h) => h.type === 'session/event');
+    evt.fn({}, { type: 'assistant/message', seq: 1, time: t0, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 800, outputTokens: 200 } } });
+  } finally {
+    Date.now = realNow;
+  }
+  // 3) /stats 读取
+  const cmd = commands.find((c) => c.name === 'stats');
+  const result = await cmd.handler({ rawInput: '', signal: new AbortController().signal });
+  assert.equal(result.kind, 'success');
+  assert.match(result.text, /== Token 消耗（近 7 天）==/);
+  assert.match(result.text, /合计\s+1,000 tokens/);
+  assert.match(result.text, /== DeepSeek API 金额花费（近 7 天）==/);
+  // 花费 110 → 100 = 10.00（跨午夜时按日均摊，但合计恒定）
+  assert.match(result.text, /合计\s+10\.00 CNY/);
+  // 4) 指定天数
+  const r30 = await cmd.handler({ rawInput: '30', signal: new AbortController().signal });
+  assert.equal(r30.kind, 'success');
+  assert.match(r30.text, /近 30 天/);
+});
+
+test('/stats：非法天数参数被拒绝，超界天数被钳制', async () => {
+  const { ctx, commands } = makeCtx();
+  mod.apply(ctx);
+  const cmd = commands.find((c) => c.name === 'stats');
+  const bad = await cmd.handler({ rawInput: 'abc', signal: new AbortController().signal });
+  assert.equal(bad.kind, 'error');
+  assert.match(bad.text, /天数无效/);
+  // 超界 999 → 钳到 60：不报“天数无效”，走无数据分支
+  const over = await cmd.handler({ rawInput: '999', signal: new AbortController().signal });
+  assert.equal(over.kind, 'error');
+  assert.doesNotMatch(over.text, /天数无效/);
+  assert.match(over.text, /暂无统计数据/);
 });
 
 /** 调用路由 handler，返回解析后的 payload（或原始响应记录）。 */async function callRoute(ctx, routes, method, raw = false) {
