@@ -320,16 +320,25 @@ function computeDailySpend(samples, now, days = SPEND_CHART_DAYS) {
   return out;
 }
 
-/** 按自然日累加 token（当天已存在则累加，否则新建），并裁剪超出保留窗口的旧日。 */
+/** 'M-D' → 年内日序号（0 起，非闰年基准；仅用于同一年内的先后比较）。 */
+function dayKeyToDayOfYear(key) {
+  const [m, d] = key.split('-').map((n) => parseInt(n, 10));
+  return Math.round((Date.UTC(2001, m - 1, d) - Date.UTC(2001, 0, 1)) / 86400000);
+}
+
+/** 按自然日累加 token（当天已存在则累加，否则新建），并裁剪超出保留窗口的旧日。
+ *  裁剪用「年内日序号」比较，修复 M-D 字符串在跨月时错序
+ *  （如 '10-1' 字典序小于 '9-30'）导致错误裁剪的缺陷。 */
 function recordTokenDay(tokenDays, now, tokens) {
   const d = new Date(now);
   const date = `${d.getMonth() + 1}-${d.getDate()}`;
   const row = tokenDays.find((r) => r.date === date);
   if (row) row.tokens += tokens;
   else tokenDays.push({ date, tokens });
-  const cutoffDate = `${new Date(now - (TOKEN_KEEP_DAYS - 1) * 86400000).getMonth() + 1}-${new Date(now - (TOKEN_KEEP_DAYS - 1) * 86400000).getDate()}`;
-  // 保留窗口按日期字符串排序比较（M-D 形式在同一年内可直接字典序比较）
-  while (tokenDays.length > 1 && tokenDays[0].date < cutoffDate) tokenDays.shift();
+  const yearStart = new Date(d.getFullYear(), 0, 1).getTime();
+  const cutoff = Math.floor((now - (TOKEN_KEEP_DAYS - 1) * 86400000 - yearStart) / 86400000);
+  // 数组按追加顺序即时间顺序：头部整日早于 cutoff 的移除（保留至少一条）
+  while (tokenDays.length > 1 && dayKeyToDayOfYear(tokenDays[0].date) < cutoff) tokenDays.shift();
   return tokenDays;
 }
 
@@ -659,23 +668,106 @@ function registerStateRoute(ctx, store, stats, persist) {
   return { route };
 }
 
-// —— 每日 Token 统计：监听 session/event，聚合 assistant/message 的 provider usage ——
+// —— 每日 Token 统计：监听 session/event，聚合所有 session 每次 LLM 调用的 usage ——
 // 返回 ctx.on 的 disposer（cordis 惯例），由调用方挂进 effect 生命周期。
-// DSH 事件信封：{ type, seq, time, data: { turn, step, message, usage? } }
-// （usage 由 dsh-llm 的 TokenUsage 定义：input/output/cacheRead/cacheWrite/reasoning）。
+// DSH 事件信封：{ type, seq, time, data }（assistant/message 的 data.usage、
+// assistant/chunk 的 data.chunk.type==='usage' 都来自 dsh-llm 的 TokenUsage）。
+//
+// 覆盖「所有 session 的所有调用」：同一个 (session, turn, step) 的调用会先发
+// usage chunk（流式尾部样本）、成功后发 assistant/message（最终样本）——两者
+// 值相同，不能重复累计；失败/中断的调用只有 chunk 样本，必须在 step 结束时兜底
+// 提交。聚合器保证同一调用只计入一次，message 优先、chunk 兜底。
+function sumTokenUsage(u) {
+  return (
+    (u.inputTokens ?? 0) +
+    (u.outputTokens ?? 0) +
+    (u.cacheReadTokens ?? 0) +
+    (u.cacheWriteTokens ?? 0) +
+    (u.reasoningTokens ?? 0)
+  );
+}
+
+/** 每次调用（session × turn × step）的 token 只累计一次；message 优先、chunk 兜底。 */
+function createTokenAggregator() {
+  const done = new Map(); // sessionId -> Set<'turn:step'>（已累计的调用）
+  const pending = new Map(); // sessionId -> Map<'turn:step' -> chunk 样本 total>
+  const keyOf = (turn, step) => `${turn}:${step}`;
+  return {
+    /**
+     * 喂入一个 session/event，返回本次应累计的 token 数（0 = 忽略或已累计）。
+     * @param sessionId - 事件所属 session（不同 session 互不干扰）
+     * @param event - 会话事件（信封 { type, time, data }）
+     */
+    feed(sessionId, event) {
+      const data = event && event.data;
+      if (!data) return 0;
+      const turn = data.turn;
+      const step = data.step;
+      const key = keyOf(turn, step);
+      const ds = done.get(sessionId) || (done.set(sessionId, new Set()), done.get(sessionId));
+      const ps = pending.get(sessionId) || (pending.set(sessionId, new Map()), pending.get(sessionId));
+
+      if (event.type === 'assistant/chunk') {
+        // 流式尾部的 usage 样本：先缓存，等 message（最终样本）或 step 结束（失败兜底）
+        if (data.chunk && data.chunk.type === 'usage' && data.chunk.usage) {
+          ps.set(key, sumTokenUsage(data.chunk.usage));
+        }
+        return 0;
+      }
+      if (event.type === 'assistant/message') {
+        if (ds.has(key)) {
+          ps.delete(key);
+          return 0; // 同一调用已累计（HMR 重放/重复事件）
+        }
+        ds.add(key);
+        const u = data.usage;
+        if (u) {
+          ps.delete(key);
+          return sumTokenUsage(u); // 最终样本
+        }
+        const fallback = ps.get(key);
+        if (fallback !== undefined) {
+          ps.delete(key);
+          return fallback; // 成功但 adapter 未报 usage：用流式样本兜底
+        }
+        return 0;
+      }
+      if (event.type === 'step/end') {
+        // 调用失败/中断：没有 message，把流式样本兜底提交（provider 可能已计费）
+        const fallback = ps.get(key);
+        ps.delete(key);
+        if (fallback !== undefined && !ds.has(key)) {
+          ds.add(key);
+          return fallback;
+        }
+        return 0;
+      }
+      if (event.type === 'turn/end') {
+        // turn 结束：防御性提交残留样本并释放该 session 的去重状态
+        let total = 0;
+        for (const [k, v] of ps) {
+          if (!ds.has(k)) {
+            ds.add(k);
+            total += v;
+          }
+        }
+        done.delete(sessionId);
+        pending.delete(sessionId);
+        return total;
+      }
+      return 0;
+    },
+  };
+}
+
 function registerTokenListener(ctx, store, onPersist) {
+  const aggregator = createTokenAggregator();
   return ctx.on('session/event', (session, event) => {
-    if (!event || event.type !== 'assistant/message') return;
-    const u = event.data && event.data.usage;
-    if (!u) return;
-    const total =
-      (u.inputTokens ?? 0) +
-      (u.outputTokens ?? 0) +
-      (u.cacheReadTokens ?? 0) +
-      (u.cacheWriteTokens ?? 0) +
-      (u.reasoningTokens ?? 0);
-    if (total <= 0) return;
-    recordTokenDay(store.tokens, Date.now(), total);
+    const sessionId = session && typeof session.id === 'string' ? session.id : '?';
+    const tokens = aggregator.feed(sessionId, event);
+    if (tokens <= 0) return;
+    // 用事件自身时间归日（比处理时刻更贴近真实消耗时刻）
+    recordTokenDay(store.tokens, typeof event.time === 'number' ? event.time : Date.now(), tokens);
     onPersist();
   });
 }
@@ -786,11 +878,13 @@ const internals = {
   assemble,
   computeDailySpend,
   computeDailyTokens,
+  createTokenAggregator,
   fetchAdapter,
   loadSpendStore,
   recordBalanceSample,
   recordTokenDay,
   saveSpendStore,
+  sumTokenUsage,
 };
 
 export { apply, inject, name, internals };

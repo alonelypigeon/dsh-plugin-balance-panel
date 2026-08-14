@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-balance-panel",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek Harness cordis plugin: multi-provider account balances, Coding Plan usage, daily spend and token charts (/balance /plan) with a right-side liquid-glass bubble panel",
   "type": "module",
   "main": "index.js",
@@ -20,7 +20,6 @@
   },
   "license": "MIT",
   "author": "dsh-plugin-balance-panel contributors",
-  "private": true,
   "keywords": [
     "deepseek-harness",
     "dsh",

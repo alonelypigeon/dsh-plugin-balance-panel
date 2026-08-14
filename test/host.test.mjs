@@ -638,6 +638,56 @@ test('Token 统计：session/event 监听聚合 assistant/message 的 usage 并�
   assert.equal(saved.tokens[0].tokens, 2000);
 });
 
+test('Token 聚合：同一次调用 chunk 与 message 只计一次（message 优先）', () => {
+  const { createTokenAggregator } = mod.internals;
+  const agg = createTokenAggregator();
+  // 流式 usage chunk 先到（1000），随后 assistant/message 带最终 usage（1050）
+  assert.equal(agg.feed('s1', { type: 'assistant/chunk', time: 1, data: { turn: 0, step: 0, chunk: { type: 'usage', usage: { inputTokens: 800, outputTokens: 200 } } } }), 0, 'chunk 先缓存不累计');
+  assert.equal(agg.feed('s1', { type: 'assistant/message', time: 2, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 850, outputTokens: 200 } } }), 1050, 'message 最终样本累计一次');
+  // 同一调用重复事件（HMR 重放）不再累计
+  assert.equal(agg.feed('s1', { type: 'assistant/message', time: 3, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 850, outputTokens: 200 } } }), 0, '已累计的调用不重复');
+});
+
+test('Token 聚合：失败/中断调用由 step/end 兜底提交 chunk 样本', () => {
+  const { createTokenAggregator } = mod.internals;
+  const agg = createTokenAggregator();
+  assert.equal(agg.feed('s1', { type: 'assistant/chunk', time: 1, data: { turn: 0, step: 3, chunk: { type: 'usage', usage: { inputTokens: 500, outputTokens: 150 } } } }), 0);
+  // 无 assistant/message（调用失败/中断）→ step/end 提交早期样本
+  assert.equal(agg.feed('s1', { type: 'step/end', time: 2, data: { turn: 0, step: 3 } }), 650, '失败调用兜底计入');
+  // 再次 step/end 不重复
+  assert.equal(agg.feed('s1', { type: 'step/end', time: 3, data: { turn: 0, step: 3 } }), 0);
+});
+
+test('Token 聚合：不同 session 独立累计，turn/end 清理状态', () => {
+  const { createTokenAggregator } = mod.internals;
+  const agg = createTokenAggregator();
+  // 两个 session 同时跑：各自累计
+  assert.equal(agg.feed('main', { type: 'assistant/message', time: 1, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 1000 } } }), 1000);
+  assert.equal(agg.feed('sub', { type: 'assistant/message', time: 2, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 2000 } } }), 2000, '子 session 独立累计');
+  // 主 session 新 turn 的同 step 号不冲突（turn/end 已清理）
+  assert.equal(agg.feed('main', { type: 'turn/end', time: 3, data: { turn: 0 } }), 0);
+  assert.equal(agg.feed('main', { type: 'assistant/message', time: 4, data: { turn: 1, step: 0, message: {}, usage: { inputTokens: 500 } } }), 500);
+  // 子 session 未清理：同 step 仍去重
+  assert.equal(agg.feed('sub', { type: 'assistant/message', time: 5, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 9999 } } }), 0);
+});
+
+test('Token 统计：跨月裁剪不错序（10-1 不早于 9-30）', () => {
+  const { recordTokenDay } = mod.internals;
+  // 旧实现用 M-D 字符串比较：'10-1' < '9-30' 会错误裁剪跨月记录
+  // 场景 A：9-30 与 10-1 都在 60 天窗口内（now = 11-15）→ 两条都保留
+  const nov15 = new Date(2026, 10, 15, 12, 0, 0).getTime();
+  let days = [];
+  days = recordTokenDay(days, new Date(2026, 8, 30, 9, 0, 0).getTime(), 100); // 9-30
+  days = recordTokenDay(days, new Date(2026, 9, 1, 9, 0, 0).getTime(), 200); // 10-1
+  assert.deepEqual(days.map((d) => d.date), ['9-30', '10-1'], '窗口内跨月两天都保留（旧实现会误裁 10-1）');
+  // 场景 B：超出窗口的旧日被裁剪（now = 12-15，8-31 已 >60 天）
+  days = [];
+  days = recordTokenDay(days, new Date(2026, 7, 31, 9, 0, 0).getTime(), 100); // 8-31
+  days = recordTokenDay(days, new Date(2026, 9, 1, 9, 0, 0).getTime(), 200); // 10-1
+  days = recordTokenDay(days, nov15, 300); // 11-15
+  assert.deepEqual(days.map((d) => d.date), ['10-1', '11-15'], '8-31 超出窗口被裁剪，10-1/11-15 保留');
+});
+
 test('/stats：无统计数据时给出提示', async () => {
   const { ctx, commands } = makeCtx();
   mod.apply(ctx);

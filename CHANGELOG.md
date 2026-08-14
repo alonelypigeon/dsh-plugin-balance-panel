@@ -2,6 +2,18 @@
 
 独立仓库：DeepSeek Harness cordis 插件（多 provider 余额/用量 + 每日花费与 Token 统计面板）。
 
+## [0.3.1] - 2026-08-14
+
+- **每日 Token 统计覆盖所有 session 的所有调用**：
+  - 新增 token 聚合器（按 session × turn × step 去重）——同一次调用先到的
+    `assistant/chunk` usage（流式尾部样本）与后到的 `assistant/message` usage
+    （最终样本）只计一次（message 优先）；**失败/中断的调用**（无 message）
+    在 `step/end` 时用 chunk 样本兜底提交，不再漏计。
+  - 子 session（subagent）与主 session 独立累计、互不干扰；`turn/end` 释放去重状态。
+- 修复 `recordTokenDay` 跨月裁剪错序缺陷：M-D 字符串比较在跨月时错乱
+  （`'10-1'` 字典序小于 `'9-30'`），改为年内日序号比较。
+- Token 归日改用事件自身 `time` 字段（贴近真实消耗时刻）。
+
 ## [0.3.0] - 2026-08-14
 
 - **通用化**：适配器表支持多种主流 API 余额与 Coding Plan 用量——
