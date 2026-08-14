@@ -1,0 +1,64 @@
+{
+  "name": "dsh-plugin-balance-panel",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness cordis plugin: query DeepSeek API account balance and Coding Plan usage (/balance /plan) with a right-side liquid-glass bubble panel",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT",
+  "author": "dsh-plugin-balance-panel contributors",
+  "private": true,
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "balance",
+    "usage"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-credentials": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
+    "esbuild": "^0.25.0"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "bundle": "node scripts/bundle.mjs",
+    "sync": "node scripts/sync-profile.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "prepublishOnly": "npm run preflight && npm test",
+    "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
+    "smoke": "node scripts/smoke-balance.mjs",
+    "check": "node --check index.js && node --check lib/client.js"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
