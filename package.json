@@ -54,7 +54,7 @@
     "sync": "node scripts/sync-profile.mjs",
     "preflight": "node scripts/preflight.mjs",
     "prepublishOnly": "npm run preflight && npm test",
-    "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
+    "test": "node --test \"test/*.test.mjs\"",
     "smoke": "node scripts/smoke-balance.mjs",
     "check": "node --check index.js && node --check lib/client.js"
   },
