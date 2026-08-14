@@ -553,10 +553,18 @@ test('Token 统计：session/event 监听聚合 assistant/message 的 usage 并�
   mod.apply(ctx);
   const evt = handlers.find((h) => h.type === 'session/event');
   assert.ok(evt, 'apply 必须注册 session/event 监听');
-  evt.fn({}, { type: 'assistant/message', turn: 0, step: 0, message: {}, usage: { inputTokens: 800, outputTokens: 200 } });
-  evt.fn({}, { type: 'assistant/message', usage: { inputTokens: 300, cacheReadTokens: 700 } });
-  evt.fn({}, { type: 'user/message', message: {} }); // 非 assistant/message 忽略
-  evt.fn({}, { type: 'assistant/message', message: {} }); // 无 usage 忽略
+  // 真实 DSH 信封：usage 在 event.data.usage（SessionEvent = { type, seq, time, data }）
+  const now = Date.now();
+  evt.fn(
+    {},
+    { type: 'assistant/message', seq: 1, time: now, data: { turn: 0, step: 0, message: {}, usage: { inputTokens: 800, outputTokens: 200 } } },
+  );
+  evt.fn(
+    {},
+    { type: 'assistant/message', seq: 2, time: now, data: { turn: 0, step: 1, message: {}, usage: { inputTokens: 300, cacheReadTokens: 700 } } },
+  );
+  evt.fn({}, { type: 'user/message', seq: 3, time: now, data: { message: {} } }); // 非 assistant/message 忽略
+  evt.fn({}, { type: 'assistant/message', seq: 4, time: now, data: { turn: 0, step: 2, message: {} } }); // 无 usage 忽略
   mockFetch([{ match: '/user/balance', body: BALANCE_OK }]);
   const payload = await callRoute(ctx, routes, 'GET');
   const today = payload.tokenSpend.days[payload.tokenSpend.days.length - 1];

@@ -612,10 +612,13 @@ function registerStateRoute(ctx, onToken) {
 
 // —— 每日 Token 统计：监听 session/event，聚合 assistant/message 的 provider usage ——
 // 返回 ctx.on 的 disposer（cordis 惯例），由调用方挂进 effect 生命周期。
+// DSH 事件信封：{ type, seq, time, data: { turn, step, message, usage? } }
+// （usage 由 dsh-llm 的 TokenUsage 定义：input/output/cacheRead/cacheWrite/reasoning）。
 function registerTokenListener(ctx, store, onPersist) {
   return ctx.on('session/event', (session, event) => {
-    if (!event || event.type !== 'assistant/message' || !event.usage) return;
-    const u = event.usage;
+    if (!event || event.type !== 'assistant/message') return;
+    const u = event.data && event.data.usage;
+    if (!u) return;
     const total =
       (u.inputTokens ?? 0) +
       (u.outputTokens ?? 0) +
