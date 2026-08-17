@@ -4,6 +4,9 @@
 
 ## [0.4.0] - 2026-08-15
 
+- 修复气泡主文字（余额「金额 + 币种」长文本）溢出 64px 气泡导致不居中/被截断：
+  `.bl-bubble-pct` 增加 max-width + 省略号 + nowrap（与副文字一致），长余额
+  显示为 `110.00 C…`，完整币种信息在面板与悬停提示中。
 - **每日花费告警（`/balance alert`）**：参考社区插件（dsh-token-budget /
   dsh-session-cost）补上的防「token 跑飞」能力——
   - `/balance alert <金额>` 设置每日花费阈值（0/off 关闭，无参查看当前状态）；

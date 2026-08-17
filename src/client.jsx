@@ -218,6 +218,11 @@ const CSS = `
   line-height: 1;
   color: #fff;
   font-variant-numeric: tabular-nums;
+  /* 金额+币种长文本（如 110.00 CNY）限制在气泡宽度内，溢出省略号，保持居中 */
+  max-width: 54px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   text-shadow:
     0 1px 2px rgba(0, 0, 0, 0.65),
     0 0 6px rgba(0, 0, 0, 0.35);
